@@ -20,4 +20,4 @@ def test_msi():
 	# Each node has same type?
 	node_mapping = {"go": "biological_function"}
 	for node in msi_graph.nodes():
-		assert(msi_graph.node[node]["type"] == node_mapping.get(saved_graph.node[node]["type"], saved_graph.node[node]["type"]))
+		assert(msi_graph.nodes[node]["type"] == node_mapping.get(saved_graph.nodes[node]["type"], saved_graph.nodes[node]["type"]))

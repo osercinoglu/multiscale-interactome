@@ -20,7 +20,9 @@ class DiffusionProfiles():
 
 	def get_initial_M(self, msi):
 		# This function is adapted from the NetworkX implementation of Personalized PageRank #
-		M = nx.to_scipy_sparse_matrix(msi.graph, nodelist = msi.nodelist, weight = WEIGHT, dtype = float)
+		# Use to_scipy_sparse_array and convert to matrix for compatibility
+		M = nx.to_scipy_sparse_array(msi.graph, nodelist = msi.nodelist, weight = WEIGHT, dtype = float)
+		M = scipy.sparse.csr_matrix(M)
 		N = len(msi.graph)
 		if (N == 0):
 			assert(False)
@@ -48,7 +50,7 @@ class DiffusionProfiles():
 
 	def refine_M_S(self, M):
 		# This function is adapted from the NetworkX implementation of Personalized PageRank #
-		S = scipy.array(M.sum(axis=1)).flatten()
+		S = np.array(M.sum(axis=1)).flatten()
 		S[S != 0] = 1.0 / S[S != 0]
 		Q = scipy.sparse.spdiags(S.T, 0, *M.shape, format='csr')
 		M = Q * M
@@ -70,24 +72,24 @@ class DiffusionProfiles():
 		# Personalization vector
 		missing = set(nodelist) - set(per_dict)
 		if missing:
-			raise NetworkXError('Personalization dictionary must have a value for every node. Missing nodes %s' % missing)
-		p = scipy.array([per_dict[n] for n in nodelist], dtype=float)
+			raise nx.NetworkXError('Personalization dictionary must have a value for every node. Missing nodes %s' % missing)
+		p = np.array([per_dict[n] for n in nodelist], dtype=float)
 		p = p / p.sum()
 
 		# Dangling nodes
 		dangling_weights = p
-		is_dangling = scipy.where(S == 0)[0]
+		is_dangling = np.where(S == 0)[0]
 
 		# power iteration: make up to max_iter iterations
-		x = scipy.repeat(1.0 / N, N) # Initialize; alternatively x = p
+		x = np.repeat(1.0 / N, N) # Initialize; alternatively x = p
 		for _ in range(self.max_iter):
 			xlast = x
 			x = self.alpha * (x * M + sum(x[is_dangling]) * dangling_weights) + (1 - self.alpha) * p
 			# check convergence, l1 norm
-			err = scipy.absolute(x - xlast).sum()
+			err = np.absolute(x - xlast).sum()
 			if err < N * self.tol:
 				return x
-		raise NetworkXError('pagerank_scipy: power iteration failed to converge in %d iterations.' % self.max_iter)
+		raise nx.NetworkXError('pagerank_scipy: power iteration failed to converge in %d iterations.' % self.max_iter)
 
 	def clean_file_name(self, file_name):
 		return "".join([c for c in file_name if c.isalpha() or c.isdigit() or c==' ' or c =="_"]).rstrip()
