@@ -25,7 +25,7 @@ def filter_drug_protein_edges(
         score_cutoff (float): The threshold value.
         edge_source (str):
             - 'filter_existing' (default): keep only edges that already exist in drug_protein_df and pass the docking cutoff.
-            - 'from_docking': generate edges solely from docking pairs passing the cutoff (may include edges absent in drug_protein_df).
+            - 'from_scores': generate edges solely from docking/tool pairs passing the cutoff (may include edges absent in drug_protein_df).
         output_score_column (str): Name of the output docking score column (default: 'score').
         on_unmapped_protein (str): What to do if a docked gene cannot be mapped to a protein node id (Entrez) using drug_protein_df.
             - 'drop' (default): drop those docking-derived edges
@@ -39,8 +39,8 @@ def filter_drug_protein_edges(
         pl.DataFrame: Filtered (or generated) edges with an extra docking score column.
     """
     
-    if edge_source not in {'filter_existing', 'from_docking'}:
-        raise ValueError("edge_source must be 'filter_existing' or 'from_docking'")
+    if edge_source not in {'filter_existing', 'from_scores'}:
+        raise ValueError("edge_source must be 'filter_existing' or 'from_scores'")
 
     if better not in {'lower', 'higher'}:
         raise ValueError("better must be 'lower' or 'higher'")
@@ -100,7 +100,7 @@ def filter_drug_protein_edges(
         q_final = q_filtered_edges.group_by(original_cols).agg(score_agg.alias(output_score_column))
         return q_final.collect()
 
-    # edge_source == 'from_docking'
+    # edge_source == 'from_scores'
     # Build docking-derived (drug, gene) pairs with best passing score
     raw_score_agg = pl.col("_raw_score").min() if better == 'lower' else pl.col("_raw_score").max()
     q_pairs = (

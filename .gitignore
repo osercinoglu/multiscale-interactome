@@ -1,0 +1,16 @@
+# Data and generated artifacts
+/data/
+/results/
+/results_*/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+
+# OS / editor
+.DS_Store
+.vscode/
