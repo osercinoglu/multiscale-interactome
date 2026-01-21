@@ -29,7 +29,7 @@ from .defaults import (
 )
 from .diffusion_profiles import DiffusionProfiles
 from .compare import diffusion_profile_similarity
-from .batch import compute_all_diffusion_profiles_for_msi_across_filtered_drug2protein_tsvs, DiffusionRun
+from .batch import compute_all_diffusion_profiles_for_msi_across_filtered_drug2protein_tsvs, DiffusionRunMeta
 
 
 def compute_all_diffusion_profiles_for_msi(
