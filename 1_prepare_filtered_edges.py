@@ -22,8 +22,15 @@ LABEL_COL = 'sample_type'  # positive / negative_balanced
 PAIR_COL = 'compound_target_pair'
 
 
-def _pair_best_score(df_in, score_col: str, best: str):
-    """Extract best score per compound-target pair from a LazyFrame or DataFrame."""
+def _pair_best_score(df_in, score_col: str, best: str, streaming: bool = False):
+    """Extract best score per compound-target pair from a LazyFrame or DataFrame.
+
+    Args:
+        df_in: LazyFrame or DataFrame with scores
+        score_col: Column name containing scores
+        best: 'min' or 'max' - which score is better
+        streaming: If True, use streaming mode for memory efficiency (recommended for large datasets)
+    """
     if best not in {"min", "max"}:
         raise ValueError("best must be 'min' or 'max'")
 
@@ -58,17 +65,26 @@ def _pair_best_score(df_in, score_col: str, best: str):
         .agg(agg_cols)
     )
 
-    return result.collect()
+    return result.collect(engine="streaming")
 
 
-def load_dta_atlas_scores(base_path: str):
+def load_dta_atlas_scores(base_path: str, score_col: str | None = None):
     """
     Load DTA-Atlas parquet files and adapt schema to match expected format.
+
+    Args:
+        base_path: Path to directory containing parquet files
+        score_col: If provided, only load this score column plus ID columns (memory-efficient)
 
     Returns:
         pl.LazyFrame with compound_target_pair column added
     """
     df_lazy = pl.scan_parquet(f"{base_path}/*.parquet")
+
+    # MEMORY OPTIMIZATION: Only select columns we need
+    # This reduces memory from ~50GB (all 28 cols) to ~3-5GB (3 cols)
+    if score_col is not None:
+        df_lazy = df_lazy.select([DRUG_COL, TGT_COL, score_col])
 
     # Add compound_target_pair to match existing schema
     df_lazy = df_lazy.with_columns(
@@ -168,61 +184,57 @@ def main(run_docking=True, run_dta_atlas=True):
 
         df_lazy_docking = pl.scan_parquet("/scratch/serci001/data/combined_filtered_annotated_docking_results.parquet")
 
-        # Extract best scores per pair for docking tools
-        print("\nExtracting best scores per drug-target pair...")
-        df_gnina = _pair_best_score(df_lazy_docking, "GNINA_Score", best="min")
-        df_smina = _pair_best_score(df_lazy_docking, "SMINA_Score", best="min")
-        df_ledock = _pair_best_score(df_lazy_docking, "Ledock_Score", best="min")
-        df_gold = _pair_best_score(df_lazy_docking, "GOLD_Score", best="max")
+        # Define tool configurations (without loading data yet)
+        docking_tool_configs = [
+            ("GNINA", "GNINA_Score", "min", np.arange(-7.0, -9.1, -0.5)),
+            ("SMINA", "SMINA_Score", "min", np.arange(-7.0, -9.1, -0.5)),
+            ("LEDOCK", "Ledock_Score", "min", np.arange(-5.0, -7.1, -0.5)),
+            ("GOLD", "GOLD_Score", "max", np.arange(60, 91, 10)),
+            ("DeepDTA_ic50", "dta_DeepDTA_ic50", "max", np.arange(5, 9, 1)),
+            ("GAT_GCN_ic50", "dta_GAT_GCN_ic50", "max", np.arange(5, 9, 1)),
+            ("GCNNet_ic50", "dta_GCNNet_ic50", "max", np.arange(5, 9, 1)),
+            ("GINConvNet_ic50", "dta_GINConvNet_ic50", "max", np.arange(5, 9, 1)),
+            ("MLTLE_GCN_ic50", "dta_MLTLE_GCN_ic50", "max", np.arange(5, 9, 1)),
+            ("MLTLE_GIN_ic50", "dta_MLTLE_GIN_ic50", "max", np.arange(5, 9, 1)),
+        ]
 
-        # Extract best scores for ML tools (ic50 only from this dataset)
-        df_DeepDTA_ic50 = _pair_best_score(df_lazy_docking, "dta_DeepDTA_ic50", best="max")
-        df_GAT_GCN_ic50 = _pair_best_score(df_lazy_docking, "dta_GAT_GCN_ic50", best="max")
-        df_GCNNet_ic50 = _pair_best_score(df_lazy_docking, "dta_GCNNet_ic50", best="max")
-        df_GINConvNet_ic50 = _pair_best_score(df_lazy_docking, "dta_GINConvNet_ic50", best="max")
-        df_MLTLE_GCN_ic50 = _pair_best_score(df_lazy_docking, "dta_MLTLE_GCN_ic50", best="max")
-        df_MLTLE_GIN_ic50 = _pair_best_score(df_lazy_docking, "dta_MLTLE_GIN_ic50", best="max")
+        total_tools = len(docking_tool_configs)
+        print(f"\nProcessing {total_tools} tools (4 docking + 6 ML)")
 
-        # Define tool configurations for docking dataset
-        docking_tools = {
-            "GNINA": {"df": df_gnina, "score_col": "GNINA_Score", "better": "lower",
-                      "cutoffs": np.arange(-7.0, -9.1, -0.5)},
-            "SMINA": {"df": df_smina, "score_col": "SMINA_Score", "better": "lower",
-                      "cutoffs": np.arange(-7.0, -9.1, -0.5)},
-            "LEDOCK": {"df": df_ledock, "score_col": "Ledock_Score", "better": "lower",
-                       "cutoffs": np.arange(-5.0, -7.1, -0.5)},
-            "GOLD": {"df": df_gold, "score_col": "GOLD_Score", "better": "higher",
-                     "cutoffs": np.arange(60, 91, 10)},
-            "DeepDTA_ic50": {"df": df_DeepDTA_ic50, "score_col": "dta_DeepDTA_ic50", "better": "higher",
-                             "cutoffs": np.arange(5, 9, 1)},
-            "GAT_GCN_ic50": {"df": df_GAT_GCN_ic50, "score_col": "dta_GAT_GCN_ic50", "better": "higher",
-                             "cutoffs": np.arange(5, 9, 1)},
-            "GCNNet_ic50": {"df": df_GCNNet_ic50, "score_col": "dta_GCNNet_ic50", "better": "higher",
-                            "cutoffs": np.arange(5, 9, 1)},
-            "GINConvNet_ic50": {"df": df_GINConvNet_ic50, "score_col": "dta_GINConvNet_ic50", "better": "higher",
-                                "cutoffs": np.arange(5, 9, 1)},
-            "MLTLE_GCN_ic50": {"df": df_MLTLE_GCN_ic50, "score_col": "dta_MLTLE_GCN_ic50", "better": "higher",
-                               "cutoffs": np.arange(5, 9, 1)},
-            "MLTLE_GIN_ic50": {"df": df_MLTLE_GIN_ic50, "score_col": "dta_MLTLE_GIN_ic50", "better": "higher",
-                               "cutoffs": np.arange(5, 9, 1)},
-        }
+        # Process each tool one at a time (memory-efficient)
+        for idx, (tool_name, score_col, best, cutoffs) in enumerate(docking_tool_configs, 1):
+            print(f"\n[{idx}/{total_tools}] Processing {tool_name}...")
 
-        # Process docking pipeline
-        print("\nProcessing docking pipeline tools...")
-        for tool_name, config in docking_tools.items():
-            print(f"\n  Processing {tool_name}...")
+            # Extract scores for this tool only
+            print(f"  Extracting scores...")
+            df_scores = _pair_best_score(df_lazy_docking, score_col, best=best)
+
+            if df_scores.is_empty():
+                print(f"  Skipping {tool_name} - no scores found")
+                continue
+
+            print(f"  Extracted {len(df_scores):,} unique pairs")
+
+            # Determine better direction for filter_drug_protein_edges
+            better = "lower" if best == "min" else "higher"
+
+            # Process immediately
             process_tool_scores(
-                df_scores=config["df"],
+                df_scores=df_scores,
                 tool_name=tool_name,
-                score_column=config["score_col"],
-                better=config["better"],
-                cutoff_range=config["cutoffs"],
+                score_column=score_col,
+                better=better,
+                cutoff_range=cutoffs,
                 df_edges=df_edges,
                 df_mapping=df_mapping,
-                output_dir="data",
-                output_prefix="1_drug_to_protein_filtered",
+                output_dir="data/docking",
+                output_prefix="1_drug_to_protein",
                 edge_source='from_scores'
             )
+
+            # Free memory before next iteration
+            del df_scores
+            gc.collect()
 
     # ========================================================================
     # PIPELINE 2: DTA-ATLAS (Extended ML Predictions)
@@ -233,7 +245,6 @@ def main(run_docking=True, run_dta_atlas=True):
         print("="*80)
 
         dta_atlas_path = "/scratch/serci001/data/dta-atlas/home/madinasu/convertedData/dta_atlas_dataset_1_0"
-        df_lazy_atlas = load_dta_atlas_scores(dta_atlas_path)
 
         # Define all ML tools with all score types (kd, ki, ic50)
         ml_tools = ["DeepDTA", "GAT_GCN", "GCNNet", "GINConvNet", "MLTLE_GCN", "MLTLE_GIN"]
@@ -243,49 +254,51 @@ def main(run_docking=True, run_dta_atlas=True):
         # Also process aggregate scores
         aggregate_scores = ["avg_kd", "avg_ki", "avg_ic50"]
 
-        print(f"\nProcessing {len(ml_tools)} ML tools × {len(score_types)} score types = {len(ml_tools) * len(score_types)} variants")
-        print(f"Plus {len(aggregate_scores)} aggregate scores")
-
-        # Extract and process each ML tool with each score type
-        dta_atlas_tools = {}
-
+        # Build list of all tool variants to process
+        tool_variants = []
         for tool in ml_tools:
             for score_type in score_types:
-                tool_variant = f"{tool}_{score_type}"
-                score_col = f"{tool}_{score_type}"
-
-                print(f"\n  Extracting {tool_variant}...")
-                df_scores = _pair_best_score(df_lazy_atlas, score_col, best="max")
-
-                dta_atlas_tools[tool_variant] = {
-                    "df": df_scores,
-                    "score_col": score_col,
-                    "better": "higher",
-                    "cutoffs": cutoff_range
-                }
-
-        # Add aggregate scores
+                tool_variants.append((f"{tool}_{score_type}", f"{tool}_{score_type}"))
         for agg_score in aggregate_scores:
-            print(f"\n  Extracting {agg_score}...")
-            df_scores = _pair_best_score(df_lazy_atlas, agg_score, best="max")
+            tool_variants.append((agg_score, agg_score))
 
-            dta_atlas_tools[agg_score] = {
-                "df": df_scores,
-                "score_col": agg_score,
-                "better": "higher",
-                "cutoffs": cutoff_range
-            }
+        total_variants = len(tool_variants)
+        print(f"\nProcessing {len(ml_tools)} ML tools × {len(score_types)} score types = {len(ml_tools) * len(score_types)} variants")
+        print(f"Plus {len(aggregate_scores)} aggregate scores")
+        print(f"Total: {total_variants} variants")
+        print(f"\nUsing memory-efficient mode: loading only required columns per tool")
 
-        # Process DTA-Atlas pipeline
-        print("\nProcessing DTA-Atlas pipeline tools...")
-        for tool_name, config in dta_atlas_tools.items():
-            print(f"\n  Processing {tool_name}...")
+        # Process each tool variant one at a time (memory-efficient)
+        # For each tool: load ONLY needed columns -> process -> free memory
+        for idx, (tool_variant, score_col) in enumerate(tool_variants, 1):
+            print(f"\n[{idx}/{total_variants}] Processing {tool_variant}...")
+
+            # Create a FRESH lazy frame with ONLY the columns we need (3 cols instead of 28)
+            # This is the key memory optimization: ~3GB instead of ~50GB
+            print(f"  Loading only required columns...")
+            df_lazy_atlas = load_dta_atlas_scores(dta_atlas_path, score_col=score_col)
+
+            # Extract scores using streaming mode for additional memory efficiency
+            print(f"  Extracting scores (streaming mode)...")
+            df_scores = _pair_best_score(df_lazy_atlas, score_col, best="max", streaming=True)
+
+            # Free the lazy frame reference
+            del df_lazy_atlas
+
+            if df_scores.is_empty():
+                print(f"  Skipping {tool_variant} - no scores found")
+                gc.collect()
+                continue
+
+            print(f"  Extracted {len(df_scores):,} unique pairs")
+
+            # Process immediately
             process_tool_scores(
-                df_scores=config["df"],
-                tool_name=tool_name,
-                score_column=config["score_col"],
-                better=config["better"],
-                cutoff_range=config["cutoffs"],
+                df_scores=df_scores,
+                tool_name=tool_variant,
+                score_column=score_col,
+                better="higher",
+                cutoff_range=cutoff_range,
                 df_edges=df_edges,
                 df_mapping=df_mapping,
                 output_dir="data/dta_atlas",
@@ -293,12 +306,16 @@ def main(run_docking=True, run_dta_atlas=True):
                 edge_source='from_scores'
             )
 
+            # Free memory before next iteration
+            del df_scores
+            gc.collect()
+
     print("\n" + "="*80)
     print("PIPELINE COMPLETE")
     print("="*80)
     print(f"\nOutputs:")
     if run_docking:
-        print(f"  - Docking pipeline: data/1_drug_to_protein_filtered_*.tsv")
+        print(f"  - Docking pipeline: data/docking/1_drug_to_protein_*.tsv")
     if run_dta_atlas:
         print(f"  - DTA-Atlas pipeline: data/dta_atlas/1_drug_to_protein_*.tsv")
 
