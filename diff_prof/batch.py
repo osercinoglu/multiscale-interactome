@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import gc
 import glob
+import logging
 import os
 from dataclasses import dataclass
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence, TYPE_CHECKING
 
 from msi.msi import MSI
+
+if TYPE_CHECKING:
+    from utils.remote_sync import RemoteSync
 
 from .defaults import (
 	DEFAULT_ALPHA,
@@ -51,6 +55,89 @@ def _run_has_saved_artifacts(run_dir: str) -> bool:
 	)
 
 
+def _get_expected_profile_count(run_dir: str) -> int | None:
+	"""Determine expected profile count from saved artifacts.
+
+	Works with both new format (worker data files) and old format (graph.pkl only).
+	"""
+	# Try new format first (faster, doesn't load full graph)
+	try:
+		msi_data = MSI.load_worker_data(run_dir)
+		return len(msi_data['drugs_in_graph']) + len(msi_data['indications_in_graph'])
+	except FileNotFoundError:
+		pass
+
+	# Fall back to old format: load graph and count drug/indication nodes
+	graph_path = os.path.join(run_dir, "graph.pkl")
+	if not os.path.exists(graph_path):
+		return None
+
+	try:
+		import pickle
+		with open(graph_path, "rb") as f:
+			graph = pickle.load(f)
+
+		# Count nodes by type
+		count = 0
+		for node in graph.nodes():
+			node_type = graph.nodes[node].get("type")
+			if node_type in ("drug", "indication"):
+				count += 1
+		return count
+	except Exception:
+		return None
+
+
+def _count_existing_profiles(run_dir: str) -> int:
+	"""Count existing profile .npy files in run directory."""
+	profiles = glob.glob(os.path.join(run_dir, "*_p_visit_array.npy"))
+	return len(profiles)
+
+
+def _run_is_complete(
+	run_dir: str,
+	remote_sync: "RemoteSync | None" = None,
+	run_id: str | None = None,
+) -> bool:
+	"""Check if run has all expected profiles (complete computation).
+
+	Checks local first, then remote if available.
+
+	Args:
+		run_dir: Local directory for this run
+		remote_sync: Optional RemoteSync instance for checking remote
+		run_id: Run ID for remote path construction (required if remote_sync provided)
+
+	Returns:
+		True if run is complete (locally or remotely)
+	"""
+	# Try to get expected count from local artifacts
+	expected = None
+	if _run_has_saved_artifacts(run_dir):
+		expected = _get_expected_profile_count(run_dir)
+
+	# If no local artifacts, we can't determine expected count
+	# (Remote-only completion check would require remote artifacts)
+	if expected is None:
+		return False
+
+	# Check local first
+	local_count = _count_existing_profiles(run_dir)
+	if local_count == expected:
+		return True
+
+	# Check remote if available
+	if remote_sync and run_id:
+		try:
+			remote_count = remote_sync.count_remote_profiles(run_id)
+			if remote_count == expected:
+				return True
+		except Exception:
+			pass  # Fall back to local-only checking
+
+	return False
+
+
 def compute_all_diffusion_profiles_for_msi_across_filtered_drug2protein_tsvs(
 	*,
 	save_root: str,
@@ -59,6 +146,11 @@ def compute_all_diffusion_profiles_for_msi_across_filtered_drug2protein_tsvs(
 	recompute: bool = True,
 	on_error: str = "raise",
 	sequential: bool = False,
+	# Remote sync options
+	remote_sync: "RemoteSync | None" = None,
+	on_profile_complete: Callable[[str], None] | None = None,
+	# Logging
+	logger: logging.Logger | None = None,
 	# Forwarded MSI args
 	nodes=None,
 	edges=None,
@@ -88,9 +180,18 @@ def compute_all_diffusion_profiles_for_msi_across_filtered_drug2protein_tsvs(
 	to disk per run, but does not load/return diffusion vectors in memory.
 
 	Args:
-		sequential: If True, process profiles one at a time instead of parallel.
-			This uses much less memory (~15GB vs ~60GB+) but is slower.
+		save_root: Root directory for output
+		drug2protein_glob: Glob pattern for finding TSV files
+		drug2protein_file_paths: Explicit list of TSV paths (overrides glob)
+		recompute: If True, recompute all; if False, skip complete runs
+		on_error: 'raise' or 'skip'
+		sequential: If True, process profiles one at a time (low memory mode)
+		remote_sync: Optional RemoteSync instance for remote completion checking
+		on_profile_complete: Optional callback for each completed profile
+		logger: Optional logger instance
+		... (MSI and diffusion hyperparameters)
 	"""
+	log = logger or logging.getLogger("diffusion_profiles")
 	if on_error not in {"raise", "skip"}:
 		raise ValueError("on_error must be 'raise' or 'skip'")
 
@@ -150,12 +251,47 @@ def compute_all_diffusion_profiles_for_msi_across_filtered_drug2protein_tsvs(
 	for file_idx, path in enumerate(drug2protein_file_paths, 1):
 		run_id = _safe_run_id_from_path(path)
 		out_dir = os.path.join(save_root, run_id)
+		filename = os.path.basename(path)
+
+		log.info(f"[{file_idx}/{total_files}] Processing: {filename}")
+
+		# Skip complete runs when not recomputing (check local and remote)
+		if not recompute and _run_is_complete(out_dir, remote_sync=remote_sync, run_id=run_id):
+			expected = _get_expected_profile_count(out_dir)
+			local_count = _count_existing_profiles(out_dir)
+			if local_count == expected:
+				log.info(f"  Already complete locally ({expected} profiles). Skipping.")
+			else:
+				log.info(f"  Already complete on remote ({expected} profiles). Skipping.")
+			runs[run_id] = DiffusionRunMeta(
+				run_id=run_id,
+				drug2protein_file_path=path,
+				save_load_file_path=out_dir,
+				computed=False,
+			)
+			continue
+
 		os.makedirs(out_dir, exist_ok=True)
 
-		print(f"\n[{file_idx}/{total_files}] Processing: {os.path.basename(path)}")
-
 		try:
-			if recompute:
+			# Determine if we need to compute
+			# - recompute=True: always compute
+			# - recompute=False but incomplete: compute (fix partial state)
+			# - recompute=False and complete: already handled above (skip)
+			needs_compute = recompute or not _run_is_complete(
+				out_dir, remote_sync=remote_sync, run_id=run_id
+			)
+
+			if needs_compute:
+				if not recompute:
+					# Resume mode but incomplete - explain why we're recomputing
+					actual = _count_existing_profiles(out_dir)
+					expected = _get_expected_profile_count(out_dir)
+					if expected is not None:
+						log.info(f"  Incomplete ({actual}/{expected} profiles). Recomputing...")
+					else:
+						log.info(f"  No completion data found. Computing...")
+
 				msi = MSI(
 					nodes=resolved_nodes,
 					edges=resolved_edges,
@@ -180,21 +316,24 @@ def compute_all_diffusion_profiles_for_msi_across_filtered_drug2protein_tsvs(
 					num_cores=resolved_num_cores,
 					save_load_file_path=out_dir,
 				)
-				dp.calculate_diffusion_profiles(msi, sequential=sequential)
+				dp.calculate_diffusion_profiles(
+					msi,
+					sequential=sequential,
+					on_profile_complete=on_profile_complete,
+					logger=log,
+				)
 				computed = True
 
 				# CRITICAL: Free memory after each run to prevent accumulation
 				del dp
 				del msi
 				gc.collect()
-				print(f"  Completed and freed memory for: {run_id}")
+				log.info(f"  Completed and freed memory for: {run_id}")
 			else:
-				computed = _run_has_saved_artifacts(out_dir)
-				if not computed:
-					raise FileNotFoundError(
-						f"Missing saved diffusion artifacts in {out_dir!r}; rerun with recompute=True"
-					)
-				print(f"  Using existing artifacts for: {run_id}")
+				# This branch should not be reached due to the skip logic above
+				# but keep for safety
+				computed = True
+				log.info(f"  Using existing artifacts for: {run_id}")
 
 			runs[run_id] = DiffusionRunMeta(
 				run_id=run_id,
@@ -203,7 +342,8 @@ def compute_all_diffusion_profiles_for_msi_across_filtered_drug2protein_tsvs(
 				computed=computed,
 			)
 		except Exception as e:
-			print(f"  ERROR: {e}")
+			log.error(f"  ERROR: {e}")
+			log.debug(f"  Exception details:", exc_info=True)
 			if on_error == "skip":
 				gc.collect()  # Still try to free memory on error
 				continue

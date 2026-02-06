@@ -156,6 +156,55 @@ class MSI():
 		with open(node2idx_file_path, "wb") as f:
 			pickle.dump(self.node2idx, f)
 
+	def save_worker_data(self, save_load_file_path):
+		"""Save minimal data required by diffusion profile worker processes."""
+		# Save drug_or_indication2proteins
+		d2p_path = os.path.join(save_load_file_path, "drug_or_indication2proteins.pkl")
+		with open(d2p_path, "wb") as f:
+			pickle.dump(self.drug_or_indication2proteins, f)
+
+		# Save drugs_in_graph and indications_in_graph
+		lists_path = os.path.join(save_load_file_path, "drugs_indications_lists.pkl")
+		with open(lists_path, "wb") as f:
+			pickle.dump({
+				'drugs_in_graph': self.drugs_in_graph,
+				'indications_in_graph': self.indications_in_graph
+			}, f)
+
+	@staticmethod
+	def load_worker_data(save_load_file_path):
+		"""Load minimal data required by diffusion profile worker processes.
+
+		Returns dict with: node2idx, nodelist, drug_or_indication2proteins,
+		                   drugs_in_graph, indications_in_graph
+		"""
+		# Load node2idx
+		node2idx_path = os.path.join(save_load_file_path, "node2idx.pkl")
+		with open(node2idx_path, "rb") as f:
+			node2idx = pickle.load(f)
+
+		# Reconstruct nodelist from node2idx
+		idx2node = {v: k for k, v in node2idx.items()}
+		nodelist = [idx2node[i] for i in range(len(idx2node))]
+
+		# Load drug_or_indication2proteins
+		d2p_path = os.path.join(save_load_file_path, "drug_or_indication2proteins.pkl")
+		with open(d2p_path, "rb") as f:
+			drug_or_indication2proteins = pickle.load(f)
+
+		# Load drugs/indications lists
+		lists_path = os.path.join(save_load_file_path, "drugs_indications_lists.pkl")
+		with open(lists_path, "rb") as f:
+			lists_data = pickle.load(f)
+
+		return {
+			'node2idx': node2idx,
+			'nodelist': nodelist,
+			'drug_or_indication2proteins': drug_or_indication2proteins,
+			'drugs_in_graph': lists_data['drugs_in_graph'],
+			'indications_in_graph': lists_data['indications_in_graph'],
+		}
+
 	def load_drugs_in_graph(self):
 		self.drugs_in_graph = list(self.type2nodes[DRUG])
 
