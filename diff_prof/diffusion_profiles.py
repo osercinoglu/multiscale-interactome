@@ -122,22 +122,37 @@ class DiffusionProfiles():
 				batched_list.append(list_[i:i + batch_size])
 		return batched_list
 
-	def calculate_diffusion_profiles(self, msi):
+	def calculate_diffusion_profiles(self, msi, sequential=False):
 		# Save MSI graph and node2idx
-		msi.save_graph(self.save_load_file_path) 
+		msi.save_graph(self.save_load_file_path)
 		msi.save_node2idx(self.save_load_file_path)
 
 		# Weight graph
 		msi.weight_graph(self.weights)
 
-		# Prepare to run power iteration in parallel
+		# Prepare to run power iteration
 		self.get_initial_M(msi)
 		computation_list = [[i] for i in msi.drugs_in_graph + msi.indications_in_graph]
+		total_items = len(computation_list)
 
-		# Run power iteration in parallel
+		# Sequential mode: process one at a time (low memory, no fork duplication)
+		if sequential or self.num_cores == 1:
+			print(f"  Computing {total_items} diffusion profiles sequentially (low memory mode)...")
+			for idx, item in enumerate(computation_list, 1):
+				self.calculate_diffusion_profile(msi, item)
+				# Progress every 100 items or at milestones
+				if idx % 100 == 0 or idx == total_items or idx in [1, 10, 50]:
+					print(f"    Progress: {idx}/{total_items} ({100*idx//total_items}%)")
+			print(f"  All {total_items} profiles computed.")
+			return
+
+		# Parallel mode: use multiprocessing (higher memory due to fork)
 		computation_list_batches = self.batch_list(computation_list, num_cores = self.num_cores)
+		total_batches = len(computation_list_batches)
+		print(f"  Computing {total_items} diffusion profiles in {total_batches} batches ({self.num_cores} cores)...")
 
 		procs = []
+		batches_started = 0
 		for computation_list_batch in computation_list_batches:
 			# Don't launch more processes than the maximum number of cores
 			while(len([job for job in procs if job.is_alive()]) == self.num_cores):
@@ -146,6 +161,12 @@ class DiffusionProfiles():
 			proc = multiprocessing.Process(target = self.calculate_diffusion_profile_batch, args = (msi, computation_list_batch))
 			procs.append(proc)
 			proc.start()
+			batches_started += 1
+
+			# Progress message every 10% or at the end
+			progress_interval = max(1, total_batches // 10)
+			if batches_started % progress_interval == 0 or batches_started == total_batches:
+				print(f"    Started batch {batches_started}/{total_batches} ({100*batches_started//total_batches}%)")
 
 		# Wait until all processes done before moving forward
 		while(len([job for job in procs if job.is_alive()]) > 0):
@@ -153,8 +174,10 @@ class DiffusionProfiles():
 
 		# Stop all of the jobs and close them
 		for job in procs:
-			proc.join()
-			proc.terminate()
+			job.join()
+			job.terminate()
+
+		print(f"  All {total_items} profiles computed.")
 
 	def load_diffusion_profiles(self, drugs_and_indications):
 		assert(not(self.save_load_file_path is None))

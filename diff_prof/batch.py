@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import glob
 import os
 from dataclasses import dataclass
@@ -57,6 +58,7 @@ def compute_all_diffusion_profiles_for_msi_across_filtered_drug2protein_tsvs(
 	drug2protein_file_paths: Sequence[str] | None = None,
 	recompute: bool = True,
 	on_error: str = "raise",
+	sequential: bool = False,
 	# Forwarded MSI args
 	nodes=None,
 	edges=None,
@@ -84,6 +86,10 @@ def compute_all_diffusion_profiles_for_msi_across_filtered_drug2protein_tsvs(
 
 	This function is intentionally low-RAM: it computes and saves diffusion profiles
 	to disk per run, but does not load/return diffusion vectors in memory.
+
+	Args:
+		sequential: If True, process profiles one at a time instead of parallel.
+			This uses much less memory (~15GB vs ~60GB+) but is slower.
 	"""
 	if on_error not in {"raise", "skip"}:
 		raise ValueError("on_error must be 'raise' or 'skip'")
@@ -140,10 +146,13 @@ def compute_all_diffusion_profiles_for_msi_across_filtered_drug2protein_tsvs(
 
 	runs: dict[str, DiffusionRunMeta] = {}
 
-	for path in drug2protein_file_paths:
+	total_files = len(drug2protein_file_paths)
+	for file_idx, path in enumerate(drug2protein_file_paths, 1):
 		run_id = _safe_run_id_from_path(path)
 		out_dir = os.path.join(save_root, run_id)
 		os.makedirs(out_dir, exist_ok=True)
+
+		print(f"\n[{file_idx}/{total_files}] Processing: {os.path.basename(path)}")
 
 		try:
 			if recompute:
@@ -171,14 +180,21 @@ def compute_all_diffusion_profiles_for_msi_across_filtered_drug2protein_tsvs(
 					num_cores=resolved_num_cores,
 					save_load_file_path=out_dir,
 				)
-				dp.calculate_diffusion_profiles(msi)
+				dp.calculate_diffusion_profiles(msi, sequential=sequential)
 				computed = True
+
+				# CRITICAL: Free memory after each run to prevent accumulation
+				del dp
+				del msi
+				gc.collect()
+				print(f"  Completed and freed memory for: {run_id}")
 			else:
 				computed = _run_has_saved_artifacts(out_dir)
 				if not computed:
 					raise FileNotFoundError(
 						f"Missing saved diffusion artifacts in {out_dir!r}; rerun with recompute=True"
 					)
+				print(f"  Using existing artifacts for: {run_id}")
 
 			runs[run_id] = DiffusionRunMeta(
 				run_id=run_id,
@@ -186,8 +202,10 @@ def compute_all_diffusion_profiles_for_msi_across_filtered_drug2protein_tsvs(
 				save_load_file_path=out_dir,
 				computed=computed,
 			)
-		except Exception:
+		except Exception as e:
+			print(f"  ERROR: {e}")
 			if on_error == "skip":
+				gc.collect()  # Still try to free memory on error
 				continue
 			raise
 
