@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import glob
 import os
+import sys
 import time
 
 
@@ -89,6 +90,7 @@ def main(
     logger.info("=" * 80)
     logger.info("DIFFUSION PROFILE COMPUTATION")
     logger.info("=" * 80)
+    logger.info(f"Command: {' '.join(sys.argv)}")
 
     # Construct MSI data file paths
     indication2protein_path = os.path.join(data_dir, "2_indication_to_protein.tsv")
@@ -183,6 +185,7 @@ def main(
                 sequential=sequential,
                 num_cores=num_cores,
                 remote_sync=remote_sync,
+                delete_after_upload=delete_after_upload,
                 logger=logger,
                 indication2protein_file_path=indication2protein_path,
                 protein2protein_file_path=protein2protein_path,
@@ -248,6 +251,7 @@ def main(
                             sequential=sequential,
                             num_cores=num_cores,
                             remote_sync=remote_sync,
+                            delete_after_upload=delete_after_upload,
                             logger=logger,
                             indication2protein_file_path=indication2protein_path,
                             protein2protein_file_path=protein2protein_path,
@@ -287,6 +291,7 @@ def main(
                             sequential=sequential,
                             num_cores=num_cores,
                             remote_sync=remote_sync,
+                            delete_after_upload=delete_after_upload,
                             logger=logger,
                             indication2protein_file_path=indication2protein_path,
                             protein2protein_file_path=protein2protein_path,

@@ -149,6 +149,7 @@ def compute_all_diffusion_profiles_for_msi_across_filtered_drug2protein_tsvs(
 	# Remote sync options
 	remote_sync: "RemoteSync | None" = None,
 	on_profile_complete: Callable[[str], None] | None = None,
+	delete_after_upload: bool = False,
 	# Logging
 	logger: logging.Logger | None = None,
 	# Forwarded MSI args
@@ -187,7 +188,8 @@ def compute_all_diffusion_profiles_for_msi_across_filtered_drug2protein_tsvs(
 		on_error: 'raise' or 'skip'
 		sequential: If True, process profiles one at a time (low memory mode)
 		remote_sync: Optional RemoteSync instance for remote completion checking
-		on_profile_complete: Optional callback for each completed profile
+		on_profile_complete: Optional callback for each completed profile (overrides auto-upload)
+		delete_after_upload: If True and remote_sync is set, delete local .npy after upload
 		logger: Optional logger instance
 		... (MSI and diffusion hyperparameters)
 	"""
@@ -316,10 +318,22 @@ def compute_all_diffusion_profiles_for_msi_across_filtered_drug2protein_tsvs(
 					num_cores=resolved_num_cores,
 					save_load_file_path=out_dir,
 				)
+				# Build per-run upload callback if remote_sync is configured
+				run_callback = on_profile_complete
+				if run_callback is None and remote_sync is not None:
+					from utils.remote_sync import make_upload_callback
+					run_callback = make_upload_callback(
+						remote_sync=remote_sync,
+						run_dir=run_id,
+						local_dir=out_dir,
+						delete_after_upload=delete_after_upload,
+						logger=log,
+					)
+
 				dp.calculate_diffusion_profiles(
 					msi,
 					sequential=sequential,
-					on_profile_complete=on_profile_complete,
+					on_profile_complete=run_callback,
 					logger=log,
 				)
 				computed = True
