@@ -12,6 +12,7 @@ def setup_logging(
     log_name: str = "diffusion_profiles",
     console_level: int = logging.INFO,
     file_level: int = logging.DEBUG,
+    logger_name: str = "diffusion_profiles",
 ) -> logging.Logger:
     """Configure logging to both console and file in output directory.
 
@@ -22,6 +23,7 @@ def setup_logging(
         log_name: Base name for log file
         console_level: Logging level for console output (default: INFO)
         file_level: Logging level for file output (default: DEBUG)
+        logger_name: Name for the logger instance (default: diffusion_profiles)
 
     Returns:
         Configured logger instance
@@ -32,7 +34,7 @@ def setup_logging(
     log_file = os.path.join(output_dir, f"{log_name}_{timestamp}.log")
 
     # Get or create logger
-    logger = logging.getLogger("diffusion_profiles")
+    logger = logging.getLogger(logger_name)
     logger.setLevel(logging.DEBUG)
 
     # Remove existing handlers (in case of re-initialization)

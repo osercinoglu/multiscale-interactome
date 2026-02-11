@@ -21,6 +21,12 @@ class UploadError(Exception):
     pass
 
 
+class DownloadError(Exception):
+    """Raised when file download fails after all retries."""
+
+    pass
+
+
 class RemoteSync:
     """Remote file synchronization via SSH/SFTP.
 
@@ -41,6 +47,7 @@ class RemoteSync:
         key_path: str | None = None,
         password: str | None = None,
         logger: logging.Logger | None = None,
+        timeout: int = 30,
     ):
         """Initialize RemoteSync.
 
@@ -52,6 +59,9 @@ class RemoteSync:
             key_path: Path to SSH private key (optional)
             password: SSH password (optional, will prompt if needed)
             logger: Logger instance (optional)
+            timeout: SSH/SFTP operation timeout in seconds (default: 30).
+                     Set to 0 for no timeout. Applies to connection and
+                     all SFTP channel operations.
         """
         self.host = host
         self.port = port
@@ -60,6 +70,7 @@ class RemoteSync:
         self.key_path = key_path
         self.password = password
         self.logger = logger or logging.getLogger("diffusion_profiles")
+        self.timeout = timeout if timeout > 0 else None
         self._client: SSHClient | None = None
         self._sftp: SFTPClient | None = None
 
@@ -79,6 +90,7 @@ class RemoteSync:
                 "hostname": self.host,
                 "port": self.port,
                 "username": self.username,
+                "timeout": self.timeout,
             }
             if self.key_path:
                 connect_kwargs["key_filename"] = self.key_path
@@ -87,6 +99,8 @@ class RemoteSync:
                 # Try default SSH agent / keys
                 self._client.connect(**connect_kwargs, look_for_keys=True)
             self._sftp = self._client.open_sftp()
+            if self.timeout is not None:
+                self._sftp.get_channel().settimeout(self.timeout)
             self.logger.info(f"Connected to {self.host}:{self.port} (key auth)")
             return
         except paramiko.AuthenticationException:
@@ -104,8 +118,11 @@ class RemoteSync:
                 port=self.port,
                 username=self.username,
                 password=self.password,
+                timeout=self.timeout,
             )
             self._sftp = self._client.open_sftp()
+            if self.timeout is not None:
+                self._sftp.get_channel().settimeout(self.timeout)
             self.logger.info(f"Connected to {self.host}:{self.port} (password auth)")
         except Exception as e:
             self.logger.error(f"SSH connection failed: {e}")
@@ -126,6 +143,12 @@ class RemoteSync:
                 pass
             self._client = None
         self.logger.debug("SSH connection closed")
+
+    def _reconnect(self) -> None:
+        """Close and re-establish SSH/SFTP after a channel error."""
+        self.logger.debug("Reconnecting SSH/SFTP...")
+        self.close()
+        self.connect()
 
     def __enter__(self) -> "RemoteSync":
         """Context manager entry."""
@@ -241,6 +264,10 @@ class RemoteSync:
                     f"Upload attempt {attempt} failed for {local_path}, "
                     f"retrying in {delay}s... ({e})"
                 )
+                try:
+                    self._reconnect()
+                except Exception as reconn_err:
+                    self.logger.warning(f"Reconnect failed: {reconn_err}")
                 time.sleep(delay)
                 delay *= 2  # Exponential backoff
 
@@ -299,6 +326,107 @@ class RemoteSync:
             return False
         except IOError:
             return False
+
+
+    def download_file(
+        self,
+        remote_subpath: str,
+        local_path: str,
+    ) -> bool:
+        """Download a single file from remote server with retry logic.
+
+        Args:
+            remote_subpath: Relative path under remote_path on remote
+            local_path: Local file path to save to
+
+        Returns:
+            True on success
+
+        Raises:
+            DownloadError: After MAX_RETRIES failures
+        """
+        if not self._sftp:
+            raise RuntimeError("Not connected. Call connect() first.")
+
+        remote_full = os.path.join(self.remote_path, remote_subpath)
+        local_dir = os.path.dirname(local_path)
+        if local_dir:
+            os.makedirs(local_dir, exist_ok=True)
+
+        delay = self.RETRY_DELAY
+        for attempt in range(1, self.MAX_RETRIES + 1):
+            try:
+                self._sftp.get(remote_full, local_path)
+                # Verify download completeness
+                remote_size = self._sftp.stat(remote_full).st_size
+                local_size = os.path.getsize(local_path)
+                if local_size != remote_size:
+                    os.remove(local_path)
+                    raise IOError(
+                        f"Size mismatch: local {local_size} != remote {remote_size}"
+                    )
+                self.logger.debug(f"Downloaded: {remote_full} -> {local_path}")
+                return True
+            except Exception as e:
+                # Remove partial/corrupt file left by interrupted transfer
+                if os.path.exists(local_path):
+                    try:
+                        os.remove(local_path)
+                    except OSError:
+                        pass
+                if attempt == self.MAX_RETRIES:
+                    self.logger.error(
+                        f"Failed to download {remote_full} after {self.MAX_RETRIES} attempts: {e}"
+                    )
+                    raise DownloadError(
+                        f"Failed to download {remote_full} after {self.MAX_RETRIES} attempts: {e}"
+                    )
+                self.logger.warning(
+                    f"Download attempt {attempt} failed for {remote_full}, "
+                    f"retrying in {delay}s... ({e})"
+                )
+                try:
+                    self._reconnect()
+                except Exception as reconn_err:
+                    self.logger.warning(f"Reconnect failed: {reconn_err}")
+                time.sleep(delay)
+                delay *= 2
+
+        raise DownloadError(f"Failed to download {remote_full}")
+
+    def list_remote_subdirs(self, subpath: str = "") -> list[str]:
+        """List subdirectories that contain node2idx.pkl (valid run directories).
+
+        Args:
+            subpath: Relative path under remote_path to scan
+
+        Returns:
+            Sorted list of directory names (not full paths) that are valid runs
+        """
+        if not self._sftp:
+            raise RuntimeError("Not connected. Call connect() first.")
+
+        base = os.path.join(self.remote_path, subpath) if subpath else self.remote_path
+        try:
+            entries = self._sftp.listdir(base)
+        except (FileNotFoundError, IOError):
+            return []
+
+        valid_runs = []
+        for entry in entries:
+            entry_path = os.path.join(base, entry)
+            try:
+                info = self._sftp.stat(entry_path)
+                if not stat.S_ISDIR(info.st_mode):
+                    continue
+                # Check for node2idx.pkl
+                node2idx_path = os.path.join(entry_path, "node2idx.pkl")
+                self._sftp.stat(node2idx_path)
+                valid_runs.append(entry)
+            except (FileNotFoundError, IOError):
+                continue
+
+        return sorted(valid_runs)
 
 
 def make_upload_callback(
