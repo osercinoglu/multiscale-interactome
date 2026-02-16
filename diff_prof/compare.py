@@ -7,7 +7,7 @@ import numpy as np
 
 Normalization = Literal[None, "l1", "l2"]
 AlignStrategy = Literal["auto", "position", "intersection"]
-Method = Literal["l2"]
+Method = Literal["l1", "l2", "canberra", "cosine", "correlation"]
 
 
 def _to_1d_array(x: Any) -> np.ndarray:
@@ -145,6 +145,121 @@ def diffusion_profile_similarity(
                 "l2_norm_b": norm_b,
                 "relative_l2_distance": rel_dist,
                 "similarity_transform": "1/(1+dist)",
+                "direction": "higher_is_more_similar",
+            }
+        )
+
+    elif method == "l1":
+        dist = float(np.linalg.norm(vec_a - vec_b, ord=1))
+        norm_a = float(np.linalg.norm(vec_a, ord=1))
+        norm_b = float(np.linalg.norm(vec_b, ord=1))
+        rel_dist = dist / (norm_a + eps)
+
+        # Convert distance -> similarity (bounded in (0, 1])
+        sim = 1.0 / (1.0 + dist)
+
+        diagnostics.update(
+            {
+                "l1_distance": dist,
+                "l1_norm_a": norm_a,
+                "l1_norm_b": norm_b,
+                "relative_l1_distance": rel_dist,
+                "similarity_transform": "1/(1+dist)",
+                "direction": "higher_is_more_similar",
+            }
+        )
+
+    elif method == "canberra":
+        # Canberra distance: Σ(|a_i - b_i| / (|a_i| + |b_i|))
+        # Handle division by zero with epsilon
+        numerator = np.abs(vec_a - vec_b)
+        denominator = np.abs(vec_a) + np.abs(vec_b) + eps
+        dist = float(np.sum(numerator / denominator))
+
+        # Maximum possible Canberra distance is n (number of elements)
+        max_dist = len(vec_a)
+
+        # Convert distance -> similarity (bounded in (0, 1])
+        sim = 1.0 / (1.0 + dist)
+
+        diagnostics.update(
+            {
+                "canberra_distance": dist,
+                "max_possible_canberra": max_dist,
+                "relative_canberra_distance": dist / max_dist,
+                "similarity_transform": "1/(1+dist)",
+                "direction": "higher_is_more_similar",
+            }
+        )
+
+    elif method == "cosine":
+        # Cosine similarity: (a · b) / (||a|| × ||b||)
+        dot_product = float(np.dot(vec_a, vec_b))
+        norm_a = float(np.linalg.norm(vec_a, ord=2))
+        norm_b = float(np.linalg.norm(vec_b, ord=2))
+
+        # Handle zero vectors
+        if norm_a < eps or norm_b < eps:
+            cosine_sim = 0.0
+        else:
+            cosine_sim = dot_product / (norm_a * norm_b)
+
+        # Cosine similarity is already in [-1, 1], typically [0, 1] for non-negative vectors
+        # Map to [0, 1] range: (cosine + 1) / 2
+        sim = (cosine_sim + 1.0) / 2.0
+
+        diagnostics.update(
+            {
+                "cosine_similarity": cosine_sim,
+                "dot_product": dot_product,
+                "l2_norm_a": norm_a,
+                "l2_norm_b": norm_b,
+                "similarity_transform": "(cosine+1)/2",
+                "direction": "higher_is_more_similar",
+            }
+        )
+
+    elif method == "correlation":
+        # Pearson correlation: equivalent to cosine similarity on centered vectors
+        mean_a = float(np.mean(vec_a))
+        mean_b = float(np.mean(vec_b))
+        std_a = float(np.std(vec_a))
+        std_b = float(np.std(vec_b))
+
+        # Center the vectors
+        centered_a = vec_a - mean_a
+        centered_b = vec_b - mean_b
+
+        # Handle constant vectors (std = 0)
+        if std_a < eps or std_b < eps:
+            # If both are constant and equal, perfect correlation
+            if abs(mean_a - mean_b) < eps:
+                correlation = 1.0
+            else:
+                correlation = 0.0
+        else:
+            # Compute correlation via centered cosine similarity
+            dot_product = float(np.dot(centered_a, centered_b))
+            norm_a = float(np.linalg.norm(centered_a, ord=2))
+            norm_b = float(np.linalg.norm(centered_b, ord=2))
+            correlation = dot_product / (norm_a * norm_b)
+
+        # Correlation distance is 1 - correlation
+        corr_dist = 1.0 - correlation
+
+        # Convert to similarity: correlation is already in [-1, 1]
+        # Map to [0, 1]: (correlation + 1) / 2
+        sim = (correlation + 1.0) / 2.0
+
+        diagnostics.update(
+            {
+                "correlation": correlation,
+                "correlation_distance": corr_dist,
+                "mean_a": mean_a,
+                "mean_b": mean_b,
+                "std_a": std_a,
+                "std_b": std_b,
+                "similarity_transform": "(correlation+1)/2",
                 "direction": "higher_is_more_similar",
             }
         )
