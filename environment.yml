@@ -11,6 +11,10 @@ dependencies:
   - networkx
   # Data processing
   - polars
+  # Remote sync (SSH/SFTP)
+  - paramiko
+  # Progress bars
+  - tqdm
   # Visualization
   - matplotlib
   - seaborn
