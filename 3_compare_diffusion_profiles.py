@@ -52,6 +52,7 @@ class RunInfo:
     run_id: str
     run_dir: str  # local path (may be a cache dir for remote runs)
     is_remote: bool = False
+    remote_prefix: str = ""  # subdir under remote_path; "" if remote_path IS the run
 
 
 class OutputWriter:
@@ -66,7 +67,7 @@ class OutputWriter:
         logger: logging.Logger | None = None,
     ):
         self._output_dir = output_dir
-        self._file_prefix = file_prefix
+        self._file_prefix = file_prefix.replace("/", "__")
         self._columns = columns
         self._max_rows = max_rows_per_file
         self._log = logger or logging.getLogger("compare_profiles")
@@ -138,28 +139,79 @@ def _clean_file_name(file_name: str) -> str:
     ).rstrip()
 
 
-def _load_run_metadata(run_dir: str) -> dict:
-    """Load only node2idx and drug/indication lists from a run directory.
+_PROFILE_SUFFIX = "_p_visit_array.npy"
 
-    Unlike MSI.load_worker_data(), this skips drug_or_indication2proteins.pkl
-    (~66MB) which is not needed for profile comparison.
+
+def _infer_entity_lists(filenames: typing.Iterable[str]) -> tuple[list[str], list[str]]:
+    """Infer drug/indication lists from ``.npy`` profile filenames.
+
+    DrugBank IDs start with ``DB``; everything else is treated as an
+    indication (UMLS CUI, typically ``C\\d+``).
+
+    Args:
+        filenames: Iterable of filenames (e.g. from ``os.listdir()``).
+
+    Returns:
+        (drugs, indications) — sorted lists of entity IDs.
     """
+    drugs: list[str] = []
+    indications: list[str] = []
+    for fname in filenames:
+        if not fname.endswith(_PROFILE_SUFFIX):
+            continue
+        entity_id = fname[: -len(_PROFILE_SUFFIX)]
+        if entity_id.startswith("DB"):
+            drugs.append(entity_id)
+        else:
+            indications.append(entity_id)
+    return sorted(drugs), sorted(indications)
+
+
+def _has_profiles(directory: str) -> bool:
+    """Check whether a local directory contains any .npy profile files."""
+    try:
+        return any(f.endswith(".npy") for f in os.listdir(directory))
+    except OSError:
+        return False
+
+
+def _load_run_metadata(run_dir: str) -> dict:
+    """Load node2idx and drug/indication lists from a run directory.
+
+    Falls back gracefully when metadata pkl files are missing:
+    - ``node2idx.pkl`` missing → ``node2idx``/``nodelist`` set to ``None``
+    - ``drugs_indications_lists.pkl`` missing → inferred from ``.npy`` filenames
+
+    Returns dict with keys: node2idx, nodelist, drugs_in_graph,
+    indications_in_graph.
+    """
+    node2idx = None
+    nodelist = None
     node2idx_path = os.path.join(run_dir, "node2idx.pkl")
-    with open(node2idx_path, "rb") as f:
-        node2idx = pickle.load(f)
+    if os.path.exists(node2idx_path):
+        with open(node2idx_path, "rb") as f:
+            node2idx = pickle.load(f)
+        idx2node = {v: k for k, v in node2idx.items()}
+        nodelist = [idx2node[i] for i in range(len(idx2node))]
 
-    idx2node = {v: k for k, v in node2idx.items()}
-    nodelist = [idx2node[i] for i in range(len(idx2node))]
-
+    drugs = None
+    indications = None
     lists_path = os.path.join(run_dir, "drugs_indications_lists.pkl")
-    with open(lists_path, "rb") as f:
-        lists_data = pickle.load(f)
+    if os.path.exists(lists_path):
+        with open(lists_path, "rb") as f:
+            lists_data = pickle.load(f)
+        drugs = lists_data["drugs_in_graph"]
+        indications = lists_data["indications_in_graph"]
+
+    # Fallback: infer entity lists from .npy filenames
+    if drugs is None or indications is None:
+        drugs, indications = _infer_entity_lists(os.listdir(run_dir))
 
     return {
         "node2idx": node2idx,
         "nodelist": nodelist,
-        "drugs_in_graph": lists_data["drugs_in_graph"],
-        "indications_in_graph": lists_data["indications_in_graph"],
+        "drugs_in_graph": drugs,
+        "indications_in_graph": indications,
     }
 
 
@@ -172,17 +224,21 @@ def discover_local_runs(
     runs_root: str | None,
     logger: logging.Logger,
 ) -> list[RunInfo]:
-    """Discover valid run directories from local paths."""
+    """Discover valid run directories from local paths.
+
+    A directory is considered a run if it contains ``.npy`` profile files
+    (``node2idx.pkl`` is no longer required).
+    """
     runs: list[RunInfo] = []
 
     if runs_dir:
         for d in runs_dir:
             d = d.rstrip("/")
             run_id = os.path.basename(d)
-            if os.path.exists(os.path.join(d, "node2idx.pkl")):
+            if _has_profiles(d):
                 runs.append(RunInfo(run_id=run_id, run_dir=d))
             else:
-                logger.warning(f"Skipping {d}: no node2idx.pkl")
+                logger.warning(f"Skipping {d}: no .npy profiles found")
 
     if runs_root:
         runs_root = runs_root.rstrip("/")
@@ -191,10 +247,19 @@ def discover_local_runs(
             return runs
         for entry in sorted(os.listdir(runs_root)):
             candidate = os.path.join(runs_root, entry)
-            if os.path.isdir(candidate) and os.path.exists(
-                os.path.join(candidate, "node2idx.pkl")
-            ):
+            if not os.path.isdir(candidate):
+                continue
+            if _has_profiles(candidate):
                 runs.append(RunInfo(run_id=entry, run_dir=candidate))
+            else:
+                # Maybe a category folder — scan one level deeper
+                for sub_entry in sorted(os.listdir(candidate)):
+                    sub_candidate = os.path.join(candidate, sub_entry)
+                    if os.path.isdir(sub_candidate) and _has_profiles(sub_candidate):
+                        runs.append(RunInfo(
+                            run_id=f"{entry}/{sub_entry}",
+                            run_dir=sub_candidate,
+                        ))
 
     return runs
 
@@ -204,9 +269,36 @@ def discover_remote_runs(
     cache_dir: str,
     logger: logging.Logger,
 ) -> list[RunInfo]:
-    """Discover runs on remote and download metadata to local cache."""
-    run_ids = remote_sync.list_remote_subdirs()
-    logger.info(f"Found {len(run_ids)} run(s) on remote")
+    """Discover runs on remote and download metadata to local cache.
+
+    Supports three remote layouts:
+    - remote_path IS a run directory (contains profiles directly)
+    - remote_path is a root with run subdirectories
+    - remote_path has category folders (e.g. docking/, dta_atlas/) each
+      containing run subdirectories
+
+    Metadata pkl files are downloaded when available but not required.
+    When ``drugs_indications_lists.pkl`` is missing, entity lists are
+    inferred from remote ``.npy`` filenames.
+    """
+    # Scan remote for run directories (may be slow over SSH)
+    logger.info("Scanning remote for run directories...")
+    run_ids = remote_sync.list_remote_subdirs(recursive=True)
+
+    if not run_ids:
+        # Maybe remote_path IS a single run (profiles live at root level)
+        remote_files = remote_sync.list_remote_dir()
+        if any(f.endswith(".npy") for f in remote_files):
+            run_id = os.path.basename(remote_sync.remote_path.rstrip("/"))
+            run_ids = [run_id]
+            run_id_to_prefix = {run_id: ""}
+            logger.info(f"Remote path is itself a run directory: {run_id}")
+        else:
+            logger.info("Found 0 run(s) on remote")
+            return []
+    else:
+        run_id_to_prefix = {rid: rid for rid in run_ids}
+        logger.info(f"Found {len(run_ids)} run directory(ies) on remote")
 
     runs: list[RunInfo] = []
     for run_idx, run_id in enumerate(run_ids, 1):
@@ -214,21 +306,55 @@ def discover_remote_runs(
         local_run_dir = os.path.join(cache_dir, run_id)
         os.makedirs(local_run_dir, exist_ok=True)
 
-        # Download metadata artifacts (small, always needed)
+        prefix = run_id_to_prefix[run_id]
+
+        # Try to download metadata pkl files (optional — check existence first
+        # to avoid costly 3-retry cycles for files that simply don't exist)
         for artifact in ("node2idx.pkl", "drugs_indications_lists.pkl"):
             local_path = os.path.join(local_run_dir, artifact)
             if not os.path.exists(local_path):
+                remote_subpath = os.path.join(prefix, artifact) if prefix else artifact
+                remote_full = os.path.join(remote_sync.remote_path, remote_subpath)
+                if not remote_sync.remote_file_exists(remote_full):
+                    continue
                 try:
-                    remote_sync.download_file(
-                        os.path.join(run_id, artifact), local_path
-                    )
-                except DownloadError as e:
-                    logger.warning(f"Cannot download {artifact} for {run_id}: {e}")
-                    break
-        else:
-            # Both artifacts downloaded successfully
-            runs.append(RunInfo(run_id=run_id, run_dir=local_run_dir, is_remote=True))
+                    remote_sync.download_file(remote_subpath, local_path)
+                except DownloadError:
+                    pass
 
+        # If entity lists are still missing, infer from remote .npy filenames
+        lists_path = os.path.join(local_run_dir, "drugs_indications_lists.pkl")
+        if not os.path.exists(lists_path):
+            try:
+                remote_files = remote_sync.list_remote_dir(prefix)
+            except Exception:
+                logger.warning(f"    Cannot list remote files for {run_id}, skipping")
+                continue
+            drugs, indications = _infer_entity_lists(remote_files)
+            if not drugs and not indications:
+                logger.warning(
+                    f"    Skipping {run_id}: no profiles and no metadata found"
+                )
+                continue
+            logger.info(
+                f"    Inferred {len(drugs)} drugs, {len(indications)} indications "
+                f"from filenames"
+            )
+            with open(lists_path, "wb") as f:
+                pickle.dump(
+                    {"drugs_in_graph": drugs, "indications_in_graph": indications}, f
+                )
+
+        has_node2idx = os.path.exists(os.path.join(local_run_dir, "node2idx.pkl"))
+        if not has_node2idx:
+            logger.info(f"    Note: no node2idx.pkl (between-model comparison unavailable)")
+
+        runs.append(RunInfo(
+            run_id=run_id, run_dir=local_run_dir,
+            is_remote=True, remote_prefix=prefix,
+        ))
+
+    logger.info(f"{len(runs)} of {len(run_ids)} run(s) usable")
     return runs
 
 
@@ -262,9 +388,8 @@ def ensure_profiles_local(
         leave=False,
     ):
         try:
-            remote_sync.download_file(
-                os.path.join(run.run_id, filename), local_path
-            )
+            remote_subpath = os.path.join(run.remote_prefix, filename) if run.remote_prefix else filename
+            remote_sync.download_file(remote_subpath, local_path)
             downloaded += 1
         except DownloadError:
             logger.debug(f"Profile not available for {entity_id} in {run.run_id}")
@@ -301,7 +426,7 @@ def compare_within(
         msi_data = _load_run_metadata(run.run_dir)
         drugs = msi_data["drugs_in_graph"]
         indications = msi_data["indications_in_graph"]
-        n_nodes = len(msi_data["nodelist"])
+        n_nodes = len(msi_data["nodelist"]) if msi_data["nodelist"] is not None else None
 
         logger.info(
             f"  {len(drugs)} drugs x {len(indications)} indications "
@@ -322,6 +447,11 @@ def compare_within(
         if not available_indications:
             logger.warning(f"  No indication profiles available. Skipping.")
             continue
+
+        # Infer n_nodes from profile length if metadata was missing
+        if n_nodes is None and indication_profiles:
+            first_profile = next(iter(indication_profiles.values()))
+            n_nodes = len(first_profile)
 
         writer = OutputWriter(
             within_dir, run.run_id, WITHIN_COLUMNS,
@@ -443,9 +573,22 @@ def compare_between(
         msi_data_a = _load_run_metadata(run_a.run_dir)
         msi_data_b = _load_run_metadata(run_b.run_dir)
 
-        # Precompute intersection indices ONCE per pair
+        # Between-model comparison requires node2idx for alignment
         node2idx_a = msi_data_a["node2idx"]
         node2idx_b = msi_data_b["node2idx"]
+        if node2idx_a is None or node2idx_b is None:
+            missing = []
+            if node2idx_a is None:
+                missing.append(run_a.run_id)
+            if node2idx_b is None:
+                missing.append(run_b.run_id)
+            logger.warning(
+                f"  Skipping pair: node2idx.pkl missing for {', '.join(missing)} "
+                f"(required for between-model alignment)"
+            )
+            continue
+
+        # Precompute intersection indices ONCE per pair
         common_nodes = [n for n in msi_data_a["nodelist"] if n in node2idx_b]
         n_common = len(common_nodes)
 
@@ -805,7 +948,7 @@ Examples:
     )
     parser.add_argument(
         "--runs-root",
-        help="Root directory to scan for run subdirectories containing node2idx.pkl",
+        help="Root directory to scan for run subdirectories containing .npy profiles",
     )
 
     # Between-mode options

@@ -214,12 +214,18 @@ def main(
             # ==================================================================
             if run_baseline:
                 baseline_output = output_dir if output_dir else "results/"
+                drug2protein_path = os.path.join(data_dir, "1_drug_to_protein.tsv")
                 logger.info("\n" + "=" * 80)
                 logger.info("BASELINE: Default MSI diffusion profiles")
                 logger.info("=" * 80)
                 _, _ = compute_all_diffusion_profiles_for_msi(
                     save_load_file_path=baseline_output,
                     num_cores=num_cores,
+                    drug2protein_file_path=drug2protein_path,
+                    indication2protein_file_path=indication2protein_path,
+                    protein2protein_file_path=protein2protein_path,
+                    protein2biological_function_file_path=protein2bio_func_path,
+                    biological_function2biological_function_file_path=bio_func2bio_func_path,
                 )
                 logger.info(f"Baseline profiles saved to: {baseline_output}")
 
@@ -491,6 +497,14 @@ Examples:
         help="Delete local .npy files after successful upload to remote (saves disk space)"
     )
 
+    parser.add_argument(
+        "--upload-metadata",
+        action="store_true",
+        help="Upload metadata (node2idx.pkl, drugs_indications_lists.pkl) from local runs "
+             "to remote. Requires --input-dir or --output-dir and remote options. "
+             "Skips computation.",
+    )
+
     args = parser.parse_args()
 
     # Determine which pipelines to run (legacy mode)
@@ -521,6 +535,48 @@ Examples:
     remote_options = [args.remote_host, args.remote_user, args.remote_path]
     if any(remote_options) and not all(remote_options):
         parser.error("--remote-host, --remote-user, and --remote-path must all be specified together")
+
+    # --upload-metadata: upload metadata for existing local runs, then exit
+    if args.upload_metadata:
+        if not all(remote_options):
+            parser.error("--upload-metadata requires remote options (--remote-host, --remote-user, --remote-path)")
+        local_root = args.output_dir or args.input_dir
+        if not local_root:
+            parser.error("--upload-metadata requires --output-dir or --input-dir to locate local runs")
+
+        from utils.remote_sync import RemoteSync
+
+        remote_sync = RemoteSync(
+            host=args.remote_host,
+            port=args.remote_port,
+            username=args.remote_user,
+            remote_path=args.remote_path,
+            key_path=args.ssh_key,
+        )
+        remote_sync.connect()
+
+        METADATA_FILES = ("node2idx.pkl", "drugs_indications_lists.pkl")
+        uploaded = 0
+        try:
+            for entry in sorted(os.listdir(local_root)):
+                run_dir = os.path.join(local_root, entry)
+                if not os.path.isdir(run_dir):
+                    continue
+                if not os.path.exists(os.path.join(run_dir, "node2idx.pkl")):
+                    continue
+                for artifact in METADATA_FILES:
+                    local_path = os.path.join(run_dir, artifact)
+                    if os.path.exists(local_path):
+                        remote_sync.upload_file(
+                            local_path, os.path.join(entry, artifact)
+                        )
+                print(f"  Uploaded metadata for {entry}")
+                uploaded += 1
+        finally:
+            remote_sync.close()
+
+        print(f"\nDone. Uploaded metadata for {uploaded} run(s).")
+        sys.exit(0)
 
     main(
         input_dir=args.input_dir,

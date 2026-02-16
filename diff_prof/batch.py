@@ -338,6 +338,18 @@ def compute_all_diffusion_profiles_for_msi_across_filtered_drug2protein_tsvs(
 				)
 				computed = True
 
+				# Upload metadata to remote if configured
+				if remote_sync is not None:
+					for artifact in ("node2idx.pkl", "drugs_indications_lists.pkl"):
+						local_artifact = os.path.join(out_dir, artifact)
+						if os.path.exists(local_artifact):
+							try:
+								remote_sync.upload_file(
+									local_artifact, os.path.join(run_id, artifact)
+								)
+							except Exception as e:
+								log.warning(f"Failed to upload {artifact}: {e}")
+
 				# CRITICAL: Free memory after each run to prevent accumulation
 				del dp
 				del msi

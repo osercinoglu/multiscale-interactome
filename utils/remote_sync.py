@@ -235,9 +235,6 @@ class RemoteSync:
         Raises:
             UploadError: After MAX_RETRIES failures
         """
-        if not self._sftp:
-            raise RuntimeError("Not connected. Call connect() first.")
-
         remote_full = os.path.join(self.remote_path, remote_subpath)
         remote_dir = os.path.dirname(remote_full)
 
@@ -246,6 +243,8 @@ class RemoteSync:
 
         for attempt in range(1, self.MAX_RETRIES + 1):
             try:
+                if not self._sftp:
+                    self._reconnect()
                 # Create remote directories if needed
                 self._mkdir_p(remote_dir)
                 self._sftp.put(local_path, remote_full)
@@ -345,9 +344,6 @@ class RemoteSync:
         Raises:
             DownloadError: After MAX_RETRIES failures
         """
-        if not self._sftp:
-            raise RuntimeError("Not connected. Call connect() first.")
-
         remote_full = os.path.join(self.remote_path, remote_subpath)
         local_dir = os.path.dirname(local_path)
         if local_dir:
@@ -356,6 +352,8 @@ class RemoteSync:
         delay = self.RETRY_DELAY
         for attempt in range(1, self.MAX_RETRIES + 1):
             try:
+                if not self._sftp:
+                    self._reconnect()
                 self._sftp.get(remote_full, local_path)
                 # Verify download completeness
                 remote_size = self._sftp.stat(remote_full).st_size
@@ -394,14 +392,57 @@ class RemoteSync:
 
         raise DownloadError(f"Failed to download {remote_full}")
 
-    def list_remote_subdirs(self, subpath: str = "") -> list[str]:
-        """List subdirectories that contain node2idx.pkl (valid run directories).
+    def _is_run_dir(self, dir_path: str) -> bool:
+        """Check if a remote directory looks like a diffusion-profile run.
+
+        A directory is a run if it contains ``node2idx.pkl`` (fast stat check)
+        **or** any ``.npy`` file (slower listdir fallback).
+        """
+        # Fast path: metadata present
+        try:
+            self._sftp.stat(os.path.join(dir_path, "node2idx.pkl"))
+            return True
+        except (FileNotFoundError, IOError):
+            pass
+        # Slow path: check for .npy profile files
+        try:
+            return any(f.endswith(".npy") for f in self._sftp.listdir(dir_path))
+        except (FileNotFoundError, IOError):
+            return False
+
+    def list_remote_dir(self, subpath: str = "") -> list[str]:
+        """List filenames in a remote directory.
+
+        Args:
+            subpath: Relative path under remote_path to list.
+
+        Returns:
+            List of filenames (not full paths).
+        """
+        if not self._sftp:
+            raise RuntimeError("Not connected. Call connect() first.")
+        full = os.path.join(self.remote_path, subpath) if subpath else self.remote_path
+        try:
+            return self._sftp.listdir(full)
+        except (FileNotFoundError, IOError):
+            return []
+
+    def list_remote_subdirs(
+        self, subpath: str = "", recursive: bool = False,
+    ) -> list[str]:
+        """List subdirectories that look like diffusion-profile runs.
+
+        A directory is considered a run if it contains ``node2idx.pkl`` or
+        any ``.npy`` file.
 
         Args:
             subpath: Relative path under remote_path to scan
+            recursive: If True, directories that are not runs are treated
+                       as category folders and scanned one level deeper.
+                       Results include the category prefix (e.g. "docking/run_a").
 
         Returns:
-            Sorted list of directory names (not full paths) that are valid runs
+            Sorted list of run identifiers (relative to remote_path/subpath)
         """
         if not self._sftp:
             raise RuntimeError("Not connected. Call connect() first.")
@@ -412,19 +453,40 @@ class RemoteSync:
         except (FileNotFoundError, IOError):
             return []
 
+        self.logger.debug(f"Scanning {len(entries)} entries in {base}")
         valid_runs = []
-        for entry in entries:
+        for i, entry in enumerate(entries, 1):
             entry_path = os.path.join(base, entry)
             try:
                 info = self._sftp.stat(entry_path)
                 if not stat.S_ISDIR(info.st_mode):
                     continue
-                # Check for node2idx.pkl
-                node2idx_path = os.path.join(entry_path, "node2idx.pkl")
-                self._sftp.stat(node2idx_path)
-                valid_runs.append(entry)
             except (FileNotFoundError, IOError):
                 continue
+
+            if self._is_run_dir(entry_path):
+                self.logger.debug(f"  [{i}/{len(entries)}] {entry} -> run")
+                valid_runs.append(entry)
+            elif recursive:
+                # Not a run — treat as a category folder
+                self.logger.info(f"  Scanning category folder: {entry}")
+                try:
+                    sub_entries = self._sftp.listdir(entry_path)
+                except (FileNotFoundError, IOError):
+                    continue
+                for j, sub_entry in enumerate(sub_entries, 1):
+                    sub_path = os.path.join(entry_path, sub_entry)
+                    try:
+                        sub_info = self._sftp.stat(sub_path)
+                        if not stat.S_ISDIR(sub_info.st_mode):
+                            continue
+                    except (FileNotFoundError, IOError):
+                        continue
+                    if self._is_run_dir(sub_path):
+                        self.logger.debug(
+                            f"    [{j}/{len(sub_entries)}] {entry}/{sub_entry} -> run"
+                        )
+                        valid_runs.append(f"{entry}/{sub_entry}")
 
         return sorted(valid_runs)
 
