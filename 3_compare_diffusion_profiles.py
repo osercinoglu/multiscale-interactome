@@ -25,7 +25,7 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 import sys
 import time
 import typing
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 
 import numpy as np
@@ -397,6 +397,70 @@ def ensure_profiles_local(
 
 
 # ---------------------------------------------------------------------------
+# Reference / approved-pairs helpers
+# ---------------------------------------------------------------------------
+
+def _normalize_reference_columns(df: pd.DataFrame, path: str) -> pd.DataFrame:
+    """Normalize drug-indication column names to 'drug' and 'indication'.
+
+    Accepts:
+      - 'drug' + 'indication'   (existing 6_drug_indication_df.tsv format)
+      - 'drug_id' + 'ind_id'    (drug repurposing DB format)
+
+    Raises ValueError with a clear message if neither is found.
+    """
+    if "drug" in df.columns and "indication" in df.columns:
+        return df
+    if "drug_id" in df.columns and "ind_id" in df.columns:
+        return df.rename(columns={"drug_id": "drug", "ind_id": "indication"})
+    raise ValueError(
+        f"Reference file '{path}' must have columns ('drug', 'indication') "
+        f"or ('drug_id', 'ind_id'). Found: {list(df.columns)}"
+    )
+
+
+def load_approved_pairs(
+    path: str,
+    status_filter: list[str] | None,
+    logger: logging.Logger,
+) -> set[tuple[str, str]]:
+    """Load a set of (drug_id, indication_id) tuples from a reference file.
+
+    Accepts TSV or CSV; auto-detects separator. Column names 'drug'/'indication'
+    or 'drug_id'/'ind_id' are both accepted. When *status_filter* is provided
+    and the file has a 'status' column, only rows with matching values are kept.
+    """
+    with open(path) as f:
+        first_line = f.readline()
+    sep = "\t" if "\t" in first_line else ","
+
+    df = pd.read_csv(path, sep=sep, dtype=str)
+    df = _normalize_reference_columns(df, path)
+
+    if status_filter is not None:
+        if "status" in df.columns:
+            n_before = len(df)
+            df = df[df["status"].isin(status_filter)]
+            n_after = len(df)
+            logger.info(
+                f"  Approved pairs status filter {status_filter}: "
+                f"kept {n_after:,} / {n_before:,} rows"
+            )
+        else:
+            logger.warning(
+                "  --status-filter provided but approved-pairs file has no "
+                "'status' column — filter ignored."
+            )
+
+    df = df[["drug", "indication"]].dropna()
+    pairs = set(zip(df["drug"], df["indication"]))
+    logger.info(
+        f"  Loaded {len(pairs):,} approved (drug, indication) pairs from {path}"
+    )
+    return pairs
+
+
+# ---------------------------------------------------------------------------
 # Comparison: within-model
 # ---------------------------------------------------------------------------
 
@@ -404,6 +468,33 @@ WITHIN_COLUMNS = [
     "run_id", "drug_id", "indication_id",
     "similarity", "l2_distance", "n_nodes",
 ]
+
+
+def _compare_pair_worker(args):
+    """Worker function for parallel comparison (picklable for ProcessPoolExecutor).
+
+    Args:
+        args: tuple of (drug_id, indication_id, drug_profile, indication_profile,
+                        method, normalization, run_id, n_nodes)
+    """
+    drug_id, ind_id, drug_profile, ind_profile, method, norm, run_id, n_nodes = args
+
+    sim, diag = diffusion_profile_similarity(
+        drug_profile,
+        ind_profile,
+        method=method,
+        align="position",
+        normalization=norm,
+        return_diagnostics=True,
+    )
+    return {
+        "run_id": run_id,
+        "drug_id": drug_id,
+        "indication_id": ind_id,
+        "similarity": sim,
+        "l2_distance": diag.get("l2_distance"),
+        "n_nodes": n_nodes,
+    }
 
 
 def compare_within(
@@ -416,6 +507,7 @@ def compare_within(
     max_rows_per_file: int,
     remote_sync: RemoteSync | None,
     logger: logging.Logger,
+    approved_pairs: set[tuple[str, str]] | None = None,
 ) -> None:
     """Drug × indication similarity within each run."""
     within_dir = os.path.join(output_dir, "within")
@@ -475,33 +567,21 @@ def compare_within(
             if not available_drugs:
                 continue
 
-            def _compare_pair(drug_id: str, ind_id: str) -> dict:
-                sim, diag = diffusion_profile_similarity(
-                    drug_profiles[drug_id],
-                    indication_profiles[ind_id],
-                    method=method,
-                    align="position",
-                    normalization=norm,
-                    return_diagnostics=True,
-                )
-                return {
-                    "run_id": run.run_id,
-                    "drug_id": drug_id,
-                    "indication_id": ind_id,
-                    "similarity": sim,
-                    "l2_distance": diag.get("l2_distance"),
-                    "n_nodes": n_nodes,
-                }
-
-            pairs = [
-                (d, i) for d in available_drugs for i in available_indications
+            # Prepare arguments for parallel processing
+            # Format: (drug_id, ind_id, drug_profile, ind_profile, method, norm, run_id, n_nodes)
+            worker_args = [
+                (d, i, drug_profiles[d], indication_profiles[i], method, norm, run.run_id, n_nodes)
+                for d in available_drugs
+                for i in available_indications
+                if approved_pairs is None or (d, i) in approved_pairs
             ]
-            with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                futures = [ex.submit(_compare_pair, d, i) for d, i in pairs]
-                for future in futures:
-                    writer.add_row(future.result())
 
-            pairs_done += len(pairs)
+            # Use ProcessPoolExecutor for true parallelism (bypasses GIL)
+            with ProcessPoolExecutor(max_workers=max_workers) as ex:
+                for result in ex.map(_compare_pair_worker, worker_args, chunksize=100):
+                    writer.add_row(result)
+
+            pairs_done += len(worker_args)
             total_pairs = len(drugs) * len(available_indications)
             logger.info(
                 f"  Processed {pairs_done:,}/{total_pairs:,} pairs "
@@ -524,6 +604,33 @@ BETWEEN_COLUMNS = [
     "entity_id", "entity_type", "run_a", "run_b",
     "similarity", "l2_distance", "n_common_nodes",
 ]
+
+
+def _compare_between_worker(args):
+    """Worker function for between-model parallel comparison (picklable for ProcessPoolExecutor).
+
+    Args:
+        args: tuple of (entity_id, entity_type, profile_a_aligned, profile_b_aligned,
+                        method, normalization, run_a_id, run_b_id, n_common)
+    """
+    eid, etype, profile_a, profile_b, method, norm, run_a_id, run_b_id, n_common = args
+
+    sim, diag = diffusion_profile_similarity(
+        profile_a, profile_b,
+        method=method,
+        align="position",
+        normalization=norm,
+        return_diagnostics=True,
+    )
+    return {
+        "entity_id": eid,
+        "entity_type": etype,
+        "run_a": run_a_id,
+        "run_b": run_b_id,
+        "similarity": sim,
+        "l2_distance": diag.get("l2_distance"),
+        "n_common_nodes": n_common,
+    }
 
 
 def compare_between(
@@ -653,32 +760,22 @@ def compare_between(
             profiles_a = dp_a.drug_or_indication2diffusion_profile
             profiles_b = dp_b.drug_or_indication2diffusion_profile
 
-            def _compare_one(eid: str) -> dict | None:
-                if eid not in profiles_a or eid not in profiles_b:
-                    return None
-                a_aligned = profiles_a[eid][idx_a]
-                b_aligned = profiles_b[eid][idx_b]
-                sim, diag = diffusion_profile_similarity(
-                    a_aligned, b_aligned,
-                    method=method,
-                    align="position",
-                    normalization=norm,
-                    return_diagnostics=True,
-                )
-                return {
-                    "entity_id": eid,
-                    "entity_type": entity_type_map[eid],
-                    "run_a": run_a.run_id,
-                    "run_b": run_b.run_id,
-                    "similarity": sim,
-                    "l2_distance": diag.get("l2_distance"),
-                    "n_common_nodes": n_common,
-                }
+            # Prepare arguments for parallel processing
+            # Filter and align profiles, then format for worker
+            worker_args = []
+            for eid in chunk_entities:
+                if eid in profiles_a and eid in profiles_b:
+                    a_aligned = profiles_a[eid][idx_a]
+                    b_aligned = profiles_b[eid][idx_b]
+                    worker_args.append((
+                        eid, entity_type_map[eid], a_aligned, b_aligned,
+                        method, norm, run_a.run_id, run_b.run_id, n_common
+                    ))
 
-            with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                for row in ex.map(_compare_one, chunk_entities):
-                    if row is not None:
-                        writer.add_row(row)
+            # Use ProcessPoolExecutor for true parallelism (bypasses GIL)
+            with ProcessPoolExecutor(max_workers=max_workers) as ex:
+                for result in ex.map(_compare_between_worker, worker_args, chunksize=50):
+                    writer.add_row(result)
 
             entities_done += len(chunk_entities)
             logger.info(
@@ -720,6 +817,8 @@ def main(
     cache_dir: str | None = None,
     ssh_timeout: int = 30,
     clear_cache: bool = False,
+    approved_pairs_path: str | None = None,
+    status_filter: list[str] | None = None,
 ) -> None:
     start_time = time.time()
     os.makedirs(output_dir, exist_ok=True)
@@ -766,6 +865,16 @@ def main(
             logger.info(f"  Reference:        (none, pairwise)")
     if max_rows_per_file > 0:
         logger.info(f"  Max rows/file:    {max_rows_per_file}")
+    if approved_pairs_path:
+        logger.info(f"  Approved pairs:   {approved_pairs_path}")
+        if status_filter:
+            logger.info(f"  Status filter:    {status_filter}")
+
+    # Load approved pairs filter (within-mode only)
+    approved_pairs: set[tuple[str, str]] | None = None
+    if approved_pairs_path:
+        logger.info(f"\nLoading approved pairs filter...")
+        approved_pairs = load_approved_pairs(approved_pairs_path, status_filter, logger)
 
     # Setup remote if configured
     remote_sync: RemoteSync | None = None
@@ -845,33 +954,53 @@ def main(
             logger.error("Between-model comparison requires at least 2 runs.")
             return
 
-        # Dispatch
-        if mode == "within":
-            compare_within(
-                runs=runs,
-                method=method,
-                normalization=normalization,
-                chunk_size=chunk_size,
-                max_workers=max_workers,
-                output_dir=output_dir,
-                max_rows_per_file=max_rows_per_file,
-                remote_sync=remote_sync,
-                logger=logger,
-            )
-        elif mode == "between":
-            compare_between(
-                runs=runs,
-                reference_dir=reference,
-                entity_type=entity_type,
-                method=method,
-                normalization=normalization,
-                chunk_size=chunk_size,
-                max_workers=max_workers,
-                output_dir=output_dir,
-                max_rows_per_file=max_rows_per_file,
-                remote_sync=remote_sync,
-                logger=logger,
-            )
+        # Determine which methods to run
+        if method == "all":
+            methods_to_run = list(typing.get_args(Method))
+            logger.info(f"\nRunning all comparison methods: {methods_to_run}")
+        else:
+            methods_to_run = [method]
+
+        # Dispatch - loop through all requested methods
+        for method_idx, current_method in enumerate(methods_to_run, 1):
+            if len(methods_to_run) > 1:
+                logger.info(f"\n{'=' * 80}")
+                logger.info(f"METHOD {method_idx}/{len(methods_to_run)}: {current_method.upper()}")
+                logger.info(f"{'=' * 80}")
+
+            # Create method-specific output directory when running all methods
+            if method == "all":
+                method_output_dir = os.path.join(output_dir, f"method_{current_method}")
+            else:
+                method_output_dir = output_dir
+
+            if mode == "within":
+                compare_within(
+                    runs=runs,
+                    method=current_method,
+                    normalization=normalization,
+                    chunk_size=chunk_size,
+                    max_workers=max_workers,
+                    output_dir=method_output_dir,
+                    max_rows_per_file=max_rows_per_file,
+                    remote_sync=remote_sync,
+                    logger=logger,
+                    approved_pairs=approved_pairs,
+                )
+            elif mode == "between":
+                compare_between(
+                    runs=runs,
+                    reference_dir=reference,
+                    entity_type=entity_type,
+                    method=current_method,
+                    normalization=normalization,
+                    chunk_size=chunk_size,
+                    max_workers=max_workers,
+                    output_dir=method_output_dir,
+                    max_rows_per_file=max_rows_per_file,
+                    remote_sync=remote_sync,
+                    logger=logger,
+                )
 
     except DownloadError as e:
         logger.error(f"\nDownload failed: {e}")
@@ -900,7 +1029,7 @@ def main(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    method_choices = list(typing.get_args(Method))
+    method_choices = ["all"] + list(typing.get_args(Method))
 
     parser = argparse.ArgumentParser(
         description="Compare diffusion profiles across or within MSI runs.",
@@ -910,6 +1039,14 @@ Examples:
   # Within-model: drug x indication similarity
   python 3_compare_diffusion_profiles.py --mode within \\
       --runs-dir results_filtered/dta_atlas/1_drug_to_protein_gat_gcn_ic50_cutoff_5
+
+  # Run all comparison methods at once
+  python 3_compare_diffusion_profiles.py --mode within \\
+      --runs-dir results/ --method all --output-dir comparisons/
+
+  # Specific method (cosine similarity)
+  python 3_compare_diffusion_profiles.py --mode within \\
+      --runs-dir results/ --method cosine
 
   # Between-model: pairwise across all runs in a directory
   python 3_compare_diffusion_profiles.py --mode between \\
@@ -963,12 +1100,36 @@ Examples:
         help="Which entity types to compare in between-mode (default: both)",
     )
 
+    # Within-mode filtering
+    parser.add_argument(
+        "--approved-pairs",
+        default=None,
+        metavar="FILE",
+        help=(
+            "Optional CSV/TSV of known drug-indication pairs. "
+            "When provided, only (drug, indication) pairs present in this file "
+            "are written to the within-mode output. "
+            "Accepts 'drug'+'indication' or 'drug_id'+'ind_id' column names."
+        ),
+    )
+    parser.add_argument(
+        "--status-filter",
+        nargs="+",
+        default=None,
+        metavar="STATUS",
+        help=(
+            "Only include pairs with these status values from --approved-pairs "
+            "(e.g. --status-filter Approved). Ignored if --approved-pairs is not set. "
+            "Only applied when the file has a 'status' column."
+        ),
+    )
+
     # Comparison options
     parser.add_argument(
         "--method",
         choices=method_choices,
         default="l2",
-        help=f"Similarity method (default: l2, available: {method_choices})",
+        help=f"Similarity method: 'all' runs all methods, or choose one (default: l2, available: {method_choices})",
     )
     parser.add_argument(
         "--normalization",
@@ -1066,4 +1227,6 @@ Examples:
         cache_dir=args.cache_dir,
         ssh_timeout=args.ssh_timeout,
         clear_cache=args.clear_cache,
+        approved_pairs_path=args.approved_pairs,
+        status_filter=args.status_filter,
     )
